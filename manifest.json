@@ -1,0 +1,15 @@
+{
+  "id": "dayz",
+  "name": "garrison-plugin-dayz",
+  "version": "1.0.0",
+  "display_name": "DayZ",
+  "description": "RCON plugin for DayZ dedicated servers using BattlEye RCON",
+  "author": "Garrison",
+  "repo": "https://github.com/ProfessorZ/garrison-plugin-dayz",
+  "garrison_api": "1",
+  "default_ports": {
+    "game": 2302,
+    "rcon": 2302
+  },
+  "icon": "🧟‍♂️"
+}
