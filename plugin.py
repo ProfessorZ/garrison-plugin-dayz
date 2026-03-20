@@ -1,7 +1,7 @@
 """
 Garrison game plugin for DayZ dedicated servers.
 
-Uses the bundled bercon.py (BattlEye RCON UDP) for communication.
+Uses the bundled bercon.py (native async UDP BattlEye RCON v2).
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ class DayZPlugin(GamePlugin):
     custom_connection = True
 
     def __init__(self):
-        self._resolved_ip: Optional[str] = None
+        self._host: Optional[str] = None
         self._port: Optional[int] = None
         self._password: Optional[str] = None
         self._rcon: Optional[BERConConnection] = None
@@ -132,16 +132,20 @@ class DayZPlugin(GamePlugin):
         return "DayZ"
 
     async def connect_custom(self, host: str, port: int, password: str) -> None:
-        # Pre-resolve hostname — uvloop requires a resolved IP for UDP endpoints
         loop = asyncio.get_running_loop()
-        self._resolved_ip = await loop.run_in_executor(None, lambda: socket.gethostbyname(host))
+        resolved = await loop.run_in_executor(None, lambda: socket.gethostbyname(host))
+        self._host = resolved
         self._port = port
         self._password = password
-        self._rcon = BERConConnection(self._resolved_ip, port, password)
-        ok = await self._rcon.connect()
-        if not ok:
+        self._rcon = BERConConnection(resolved, port, password)
+        try:
+            ok = await asyncio.wait_for(self._rcon.connect(), timeout=10)
+            if not ok:
+                self._rcon = None
+                raise RuntimeError("BattlEye RCON login failed — check host, port, and password")
+        except asyncio.TimeoutError:
             self._rcon = None
-            raise RuntimeError(f"BattlEye RCON login failed for {host}:{port} — check password")
+            raise RuntimeError(f"Timed out connecting to DayZ RCON at {resolved}:{port}")
 
     async def disconnect_custom(self) -> None:
         if self._rcon:
@@ -150,8 +154,8 @@ class DayZPlugin(GamePlugin):
 
     async def send_command_custom(self, command: str) -> str:
         if not self._rcon:
-            raise RuntimeError("Not connected")
-        return await self._rcon.send_command(command)
+            raise RuntimeError("Not connected — call connect_custom first")
+        return await asyncio.wait_for(self._rcon.send_command(command), timeout=10)
 
     async def parse_players(self, raw_response: str) -> list:
         players = []
