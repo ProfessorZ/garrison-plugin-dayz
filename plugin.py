@@ -1,175 +1,189 @@
 """
 Garrison game plugin for DayZ dedicated servers.
 
-Uses BattlEye RCON v2 (UDP) to communicate with the server.
+Uses the bundled bercon.py (BattlEye RCON UDP) for communication.
 """
 
-import re
-import logging
-from dataclasses import dataclass, field
-from typing import Optional
+from __future__ import annotations
 
-from bercon import BERConConnection
+import asyncio
+import logging
+import re
+import socket
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from app.plugins.base import GamePlugin, PlayerInfo, ServerStatus, CommandDef, ServerOption
+except ImportError:
+    from dataclasses import dataclass, field
+    from abc import ABC, abstractmethod
 
-@dataclass
-class PlayerInfo:
-    """Represents a connected DayZ player."""
-    index: int
-    name: str
-    ip: str
-    port: int
-    ping: int
-    be_guid: Optional[str]
-    in_lobby: bool
-    steam_id: Optional[str] = field(default=None)
+    @dataclass
+    class PlayerInfo:
+        name: str
+        steam_id: Optional[str] = None
 
-    def __post_init__(self):
-        # BE GUID serves as the steam identity reference
-        if self.be_guid and not self.steam_id:
-            self.steam_id = self.be_guid
+    @dataclass
+    class ServerStatus:
+        online: bool
+        player_count: int = 0
+        version: Optional[str] = None
+        extra: dict = field(default_factory=dict)
+
+    @dataclass
+    class CommandDef:
+        name: str
+        description: str
+        category: str
+        params: list = field(default_factory=list)
+        admin_only: bool = False
+        example: str = ""
+
+    @dataclass
+    class ServerOption:
+        name: str
+        value: str
+        option_type: str
+        category: str = "General"
+        description: str = ""
+
+    class GamePlugin(ABC):
+        PLUGIN_API_VERSION = 1
+        custom_connection: bool = False
+
+        @property
+        @abstractmethod
+        def game_type(self) -> str: ...
+
+        @property
+        @abstractmethod
+        def display_name(self) -> str: ...
+
+        @abstractmethod
+        async def parse_players(self, raw_response: str) -> list: ...
+
+        @abstractmethod
+        async def get_status(self, send_command) -> ServerStatus: ...
+
+        @abstractmethod
+        def get_commands(self) -> list: ...
+
+        def format_command(self, command: str) -> str:
+            return command
+
+        async def kick_player(self, send_command, name: str, reason: str = "") -> str:
+            return await send_command(f"kick {name} {reason}".strip())
+
+        async def ban_player(self, send_command, name: str, reason: str = "") -> str:
+            return await send_command(f"ban {name} {reason}".strip())
+
+        async def unban_player(self, send_command, name: str) -> str:
+            return await send_command(f"removeBan {name}")
+
+        async def get_options(self, send_command) -> list:
+            return []
+
+        async def set_option(self, send_command, name: str, value: str) -> str:
+            return "Not supported"
+
+        async def connect_custom(self, host: str, port: int, password: str) -> None:
+            pass
+
+        async def disconnect_custom(self) -> None:
+            pass
+
+        async def send_command_custom(self, command: str) -> str:
+            raise NotImplementedError
 
 
-@dataclass
-class ServerStatus:
-    """Current server status snapshot."""
-    online: bool
-    player_count: int
-    players: list[PlayerInfo]
+from bercon import BERConConnection
+
+_PLAYER_LINE_RE = re.compile(
+    r"^\s*(\d+)\s+"            # index
+    r"(\d+\.\d+\.\d+\.\d+)"   # IP
+    r":(\d+)\s+"               # port
+    r"(\d+)\s+"                # ping
+    r"([0-9a-fA-F]{32}|-)\s+"  # BE GUID or -
+    r"(.+?)"                   # player name
+    r"(?:\s+\(Lobby\))?\s*$",
+    re.MULTILINE,
+)
 
 
-class GamePlugin:
-    """Garrison plugin for DayZ dedicated servers."""
+class DayZPlugin(GamePlugin):
+    """Garrison plugin for DayZ dedicated servers (BattlEye RCON)."""
 
-    game_type = "dayz"
-    display_name = "DayZ"
     custom_connection = True
 
-    def __init__(self, host: str, port: int, password: str):
-        self.host = host
-        self.port = port
-        self.password = password
+    def __init__(self):
+        self._resolved_ip: Optional[str] = None
+        self._port: Optional[int] = None
+        self._password: Optional[str] = None
         self._rcon: Optional[BERConConnection] = None
 
-    async def connect(self) -> bool:
-        """Establish the RCON connection."""
-        self._rcon = BERConConnection(self.host, self.port, self.password)
-        return await self._rcon.connect()
+    @property
+    def game_type(self) -> str:
+        return "dayz"
 
-    def disconnect(self):
-        """Close the RCON connection."""
+    @property
+    def display_name(self) -> str:
+        return "DayZ"
+
+    async def connect_custom(self, host: str, port: int, password: str) -> None:
+        # Pre-resolve hostname — uvloop requires a resolved IP for UDP endpoints
+        loop = asyncio.get_running_loop()
+        self._resolved_ip = await loop.run_in_executor(None, lambda: socket.gethostbyname(host))
+        self._port = port
+        self._password = password
+        self._rcon = BERConConnection(self._resolved_ip, port, password)
+        ok = await self._rcon.connect()
+        if not ok:
+            self._rcon = None
+            raise RuntimeError(f"BattlEye RCON login failed for {host}:{port} — check password")
+
+    async def disconnect_custom(self) -> None:
         if self._rcon:
             self._rcon.close()
             self._rcon = None
 
-    async def _send(self, cmd: str) -> str:
+    async def send_command_custom(self, command: str) -> str:
         if not self._rcon:
             raise RuntimeError("Not connected")
-        return await self._rcon.send_command(cmd)
+        return await self._rcon.send_command(command)
 
-    # ------------------------------------------------------------------
-    # Player parsing
-    # ------------------------------------------------------------------
-
-    _PLAYER_LINE_RE = re.compile(
-        r"^\s*(\d+)\s+"           # index
-        r"(\d+\.\d+\.\d+\.\d+)"  # IP
-        r":(\d+)\s+"              # port
-        r"(\d+)\s+"               # ping
-        r"([0-9a-fA-F]+|-)\s+"   # BE GUID (or - if not yet assigned)
-        r"(.+?)"                  # player name
-        r"(?:\s+\(Lobby\))?\s*$", # optional lobby indicator
-        re.MULTILINE,
-    )
-
-    def _parse_players(self, raw: str) -> list[PlayerInfo]:
-        """Parse the output of the `players` command."""
+    async def parse_players(self, raw_response: str) -> list:
         players = []
-        for m in self._PLAYER_LINE_RE.finditer(raw):
+        for m in _PLAYER_LINE_RE.finditer(raw_response):
             guid = m.group(5) if m.group(5) != "-" else None
-            in_lobby = "(Lobby)" in m.group(0)
             players.append(PlayerInfo(
-                index=int(m.group(1)),
                 name=m.group(6).strip(),
-                ip=m.group(2),
-                port=int(m.group(3)),
-                ping=int(m.group(4)),
-                be_guid=guid,
-                in_lobby=in_lobby,
+                steam_id=guid,
             ))
         return players
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    async def get_players(self) -> list[PlayerInfo]:
-        """Fetch and parse the current player list."""
-        raw = await self._send("players")
-        return self._parse_players(raw)
-
-    async def get_status(self) -> ServerStatus:
-        """Return current server status."""
+    async def get_status(self, send_command) -> ServerStatus:
         try:
-            players = await self.get_players()
-            return ServerStatus(online=True, player_count=len(players), players=players)
-        except Exception:
-            logger.exception("Failed to get server status")
-            return ServerStatus(online=False, player_count=0, players=[])
+            raw = await self.send_command_custom("players")
+            players = await self.parse_players(raw)
+            return ServerStatus(online=True, player_count=len(players))
+        except Exception as e:
+            logger.warning("DayZ status check failed: %s", e)
+            return ServerStatus(online=False, player_count=0)
 
-    async def kick_player(self, name: str, reason: str = "") -> str:
-        """Kick a player by name."""
-        player = await self._find_player(name)
-        if not player:
-            return f"Player '{name}' not found"
-        cmd = f"kick {player.index} {reason}".strip()
-        return await self._send(cmd)
+    async def kick_player(self, send_command, name: str, reason: str = "") -> str:
+        return await self.send_command_custom(f"kick {name} {reason}".strip())
 
-    async def ban_player(self, name: str, reason: str = "", duration: int = 0) -> str:
-        """Ban a player by name. Uses BE GUID when available, otherwise index."""
-        player = await self._find_player(name)
-        if not player:
-            return f"Player '{name}' not found"
-        if player.be_guid:
-            cmd = f"addBan {player.be_guid} {duration} {reason}".strip()
-        else:
-            cmd = f"ban {player.index} {reason}".strip()
-        return await self._send(cmd)
+    async def ban_player(self, send_command, name: str, reason: str = "") -> str:
+        return await self.send_command_custom(f"ban {name} {reason}".strip())
 
-    async def unban_player(self, identifier: str) -> str:
-        """Unban a player by finding their entry in the ban list.
+    async def unban_player(self, send_command, name: str) -> str:
+        return await self.send_command_custom(f"removeBan {name}")
 
-        `identifier` can be a name or GUID substring.
-        """
-        bans_raw = await self._send("bans")
-        # Ban list lines: "N  GUID  duration  reason"
-        for line in bans_raw.splitlines():
-            if identifier.lower() in line.lower():
-                match = re.match(r"^\s*(\d+)\s+", line)
-                if match:
-                    ban_index = match.group(1)
-                    return await self._send(f"removeBan {ban_index}")
-        return f"No ban entry matching '{identifier}' found"
-
-    async def say(self, message: str, player_index: int = -1) -> str:
-        """Broadcast a message to all players (default) or a specific player."""
-        return await self._send(f"say {player_index} {message}")
-
-    async def shutdown(self) -> str:
-        """Shut down the DayZ server."""
-        return await self._send("shutdown")
-
-    async def _find_player(self, name: str) -> Optional[PlayerInfo]:
-        """Look up a player by name (case-insensitive)."""
-        players = await self.get_players()
-        name_lower = name.lower()
-        for p in players:
-            if p.name.lower() == name_lower:
-                return p
-        # Partial match fallback
-        for p in players:
-            if name_lower in p.name.lower():
-                return p
-        return None
+    def get_commands(self) -> list:
+        try:
+            from schema import get_commands
+            return get_commands()
+        except ImportError:
+            return []
