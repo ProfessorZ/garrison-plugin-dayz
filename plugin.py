@@ -94,7 +94,7 @@ except ImportError:
         async def disconnect_custom(self) -> None:
             pass
 
-        async def send_command_custom(self, command: str) -> str:
+        async def send_command_custom(self, command: str, content: str = "") -> str:
             raise NotImplementedError
 
 
@@ -152,7 +152,7 @@ class DayZPlugin(GamePlugin):
             self._rcon.close()
             self._rcon = None
 
-    async def send_command_custom(self, command: str) -> str:
+    async def send_command_custom(self, command: str, content: str = "") -> str:
         if not self._rcon:
             raise RuntimeError("Not connected — call connect_custom first")
         return await asyncio.wait_for(self._rcon.send_command(command), timeout=10)
