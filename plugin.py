@@ -105,7 +105,7 @@ _PLAYER_LINE_RE = re.compile(
     r"(\d+\.\d+\.\d+\.\d+)"   # IP
     r":(\d+)\s+"               # port
     r"(\d+)\s+"                # ping
-    r"([0-9a-fA-F]{32}|-)\s+"  # BE GUID or -
+    r"([0-9a-fA-F]{32}|-)(?:\([^)]+\))?\s+"  # BE GUID or - (with optional status like (OK))
     r"(.+?)"                   # player name
     r"(?:\s+\(Lobby\))?\s*$",
     re.MULTILINE,
